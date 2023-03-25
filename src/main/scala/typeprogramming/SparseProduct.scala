@@ -11,6 +11,21 @@ trait :*:[L, R]
 trait ~>[K, V]
 
 //
+// Keys
+//
+
+/** Return a key in the value domain for type K */
+trait KeyFor[K]:
+  def key: K
+
+/** A key that is implicitly available for some K */
+trait Key[K]:
+  outer: K =>
+
+  given KeyFor[K] with
+    def key: K = outer
+
+//
 // Membership
 //
 
@@ -64,34 +79,87 @@ trait Product[P]
 given [P](using NoDuplicates[P]): Product[P] with {}
 
 //
-// HMap interpretation
+// (Sparse) HMap interpretation
 //
 
 case class HMapProductKey[K, V](k: K) extends HMapKey:
   type Value = V
 
 class HMapProduct[P: Product] private (map: HMap) {
+
+  type Self[P] = HMapProduct[P]
+
   def get[K, V](key: K)(using
       KeyValueIn[K, V, P]
   ): Option[V] = map.get(HMapProductKey(key))
 
-  def put[K, V](key: K, vlu: V)(using KeyValueIn[K, V, P]): HMapProduct[P] =
+  def put[K, V](key: K, vlu: V)(using KeyValueIn[K, V, P]): Self[P] =
     HMapProduct(map.put(HMapProductKey(key), vlu))
+
 }
 
 object HMapProduct:
   def empty[P: Product]: HMapProduct[P] = HMapProduct(HMap.empty)
 
+//
+// A tagged tuple implementation
+//
+
+/** A (non-sparse) version of a product, ensures that all keys in the product
+  * are available
+  */
+class TaggedTuple[P: Product] private (map: HMap) {
+  def get[K, V](key: K)(using
+      KeyValueIn[K, V, P]
+  ): V = map.get(HMapProductKey(key)).get
+
+  def extend[K, V](using
+      NoDuplicates[(K ~> V) :*: P]
+  )(key: K, vlu: V): TaggedTuple[(K ~> V) :*: P] =
+    TaggedTuple(map.put(HMapProductKey(key), vlu))
+}
+
+object TaggedTuple:
+  def initial[K, V](k: K, v: V): TaggedTuple[(K ~> V)] =
+    TaggedTuple(HMap.empty.put(HMapProductKey(k), v))
+
+//
+// Utilities
+//
+
+/* Summon instances of a particular type for all the values in the product */
+trait SummonForValues[IP, P]:
+  def instances: TaggedTuple[IP]
+
+given [F[_], K, V](using
+    instance: F[V],
+    key: KeyFor[K]
+): SummonForValues[(K ~> F[V]), (K ~> V)] with {
+
+  def instances: TaggedTuple[K ~> F[V]] =
+    TaggedTuple.initial[K, F[V]](key.key, instance)
+}
+
+given [F[_], K, V, P, IP](using
+    instance: F[V],
+    summonForAll: SummonForValues[IP, P],
+    noDup: NoDuplicates[(K ~> F[V]) :*: IP],
+    key: KeyFor[K]
+): SummonForValues[(K ~> F[V]) :*: IP, (K ~> V) :*: P] with {
+  def instances: TaggedTuple[(K ~> F[V]) :*: IP] =
+    summonForAll.instances
+      .extend[K, F[V]](key.key, instance)
+}
+
 // Examples
 object Examples extends App {
-  trait Tag
-  object IntT extends Tag
+  object IntT extends Key[IntT]
   type IntT = IntT.type
-  object PrimT extends Tag
+  object PrimT extends Key[PrimT]
   type PrimT = PrimT.type
-  object StrT extends Tag
+  object StrT extends Key[StrT]
   type StrT = StrT.type
-  object RealT extends Tag
+  object RealT extends Key[RealT]
   type RealT = RealT.type
 
   trait CP[+X]
@@ -111,6 +179,9 @@ object Examples extends App {
 
   // fails
   // summon[Product[BadProductValue]]
+
+  // Key to value level
+  summon[KeyFor[IntT]]
 
   // Insertion
 
@@ -132,4 +203,31 @@ object Examples extends App {
   // fails at compile time since key is not in the product
   // assert((exampleMap1.get(RealT): Option[CP[Double]]) == None)
 
+  // summon values for the product
+
+  trait Lattice[L]:
+    def join(a: L, b: => L): L
+
+  given [X]: Lattice[CP[X]] with
+    def join(a: CP[X], b: => CP[X]): CP[X] = (a, b) match
+      case (Top, _) | (_, Top)        => Top
+      case (Constant(x), Constant(y)) => Top
+      case (Bottom, x)                => x
+      case (y, Bottom)                => y
+
+  given [X]: Lattice[Set[X]] with
+    def join(a: Set[X], b: => Set[X]): Set[X] = a.union(b)
+
+  type Lattices = (IntT ~> Lattice[CP[Int]]) :*:
+    (StrT ~> Lattice[CP[String]]) :*: (PrimT ~> Lattice[Set[String]])
+
+  val lattices =
+    summon[SummonForValues[Lattices, ModularProductValue[CP[
+      Int
+    ], CP[
+      String
+    ]]]].instances
+
+  assert(lattices.get(IntT).join(Constant(4), Constant(5)) == Top)
+  assert(lattices.get(PrimT).join(Set("+"), Set("-")) == Set("+", "-"))
 }
